@@ -25,15 +25,17 @@ def process_image(image: dict | Image.Image, image_patch_size: int = 14) -> Imag
     if isinstance(image, Image.Image):
         return image.convert("RGB")
 
-    # Arrow / HuggingFace datasets keep every struct field. A null `image`
-    # still makes `"image" in image` True and trips the assert below, which
-    # then looks like a length-filter drop (`filter dataset len` halved).
+    # `_build_messages` used to mutate the dataset row with
+    # `image["image"] = Image.open(bytes)` while leaving `bytes` in place.
+    # The assert then fired on every VL row and the length filter dropped them.
     if isinstance(image, dict):
         image = {k: v for k, v in image.items() if v is not None}
-
-    if "bytes" in image:
-        assert "image" not in image, "Cannot have both `bytes` and `image`"
-        image["image"] = Image.open(BytesIO(image["bytes"]))
+        if "bytes" in image:
+            image.pop("image", None)
+            raw = image["bytes"]
+            if not isinstance(raw, (bytes, bytearray, memoryview)):
+                raw = raw.tobytes() if hasattr(raw, "tobytes") else bytes(raw)
+            image["image"] = Image.open(BytesIO(raw))
 
     try:
         ans = fetch_image(image, image_patch_size=image_patch_size)
