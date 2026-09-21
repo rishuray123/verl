@@ -159,7 +159,16 @@ class RLHFDataset(Dataset):
         for parquet_file in self.data_files:
             # read files and cache
             if parquet_file.endswith(".parquet"):
-                dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+                try:
+                    dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+                except Exception as e:
+                    # Large list<struct<bytes>> files (H-OPD mix, images on every row)
+                    # trip PyArrow: "Nested data conversions not implemented for chunked array outputs".
+                    print(f"HF parquet loader failed on {parquet_file}: {e}\nfalling back to pyarrow combine_chunks")
+                    import pyarrow.parquet as pq
+
+                    table = pq.read_table(parquet_file).combine_chunks()
+                    dataframe = datasets.Dataset.from_arrow(table)
             elif parquet_file.endswith(".json") or parquet_file.endswith(".jsonl"):
                 dataframe = datasets.load_dataset("json", data_files=parquet_file)["train"]
             else:
