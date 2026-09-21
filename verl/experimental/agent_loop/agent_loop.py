@@ -913,6 +913,10 @@ class AgentLoopWorker:
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
+            mix_stats = getattr(self.teacher_server_manager, "last_mix_stats", None) or {}
+            if mix_stats:
+                extra = output.extra_fields.setdefault("reward_extra_info", {})
+                extra.update(mix_stats)
 
     def _postprocess(
         self,

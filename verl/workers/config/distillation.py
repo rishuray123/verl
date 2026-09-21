@@ -246,6 +246,10 @@ class DistillationConfig(BaseConfig):
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
     teacher_key: str = "data_source"
+    # When True, every sample is scored by all teachers and mixed per token by
+    # top-k entropy (paper H-OPD). When False, teacher_key routes one teacher per row.
+    mix_teachers: bool = False
+    mix_temperature: float = 1.0
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
 
     def __post_init__(self):
