@@ -646,6 +646,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        if self.distillation_enabled and self.distillation_config is not None:
+            from verl.trainer.distillation.losses import get_distillation_loss_settings
+
+            loss_mode = self.distillation_config.distillation_loss.loss_mode
+            tu.assign_non_tensor(
+                data, distillation_use_topk=get_distillation_loss_settings(str(loss_mode)).use_topk
+            )
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 

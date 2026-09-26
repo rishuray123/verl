@@ -1097,6 +1097,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
             if use_fused_kernels:
                 log_probs = output.log_probs[:, -response_length - 1 : -1]
                 entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
+                if distillation_use_topk:
+                    raise NotImplementedError(
+                        "forward_kl_topk/reverse_kl_topk needs student logits; "
+                        "disable fused kernels (or set use_remove_padding=True)"
+                    )
 
             else:
                 logits = output.logits  # (bsz, response_length, vocab_size)
@@ -1124,6 +1129,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
                         entropy_rmpad = torch.cat([t for t in entropy.unbind()])
                         entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+                    # Paper reverse/forward KL: same logits-processor hook as the rmpad branch.
+                    # This recipe keeps use_remove_padding=False (no flash_attn).
+                    if distillation_use_topk:
+                        outputs = logits_processor_func(
+                            student_logits=logits_rmpad.unsqueeze(0), data=micro_batch
+                        )
+                        for k, v in outputs.items():
+                            v = v.squeeze(0)
+                            assert v.shape[0] == logits_rmpad.shape[0], (
+                                f"log_probs nnz: {logits_rmpad.shape[0]}, {k} shape: {v.shape}"
+                            )
+                            model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
                 else:
                     raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
