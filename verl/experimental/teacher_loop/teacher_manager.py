@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import math
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -91,6 +92,74 @@ def _topk_entropy(teacher_logprobs: torch.Tensor) -> torch.Tensor:
     return -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
 
 
+# Qwen2-VL / Qwen3-VL vision specials. Text teachers must not see these pads.
+_VISION_TOKEN_IDS = frozenset({151652, 151653, 151654, 151655, 151656})
+
+
+def strip_vision_tokens(ids: list[int]) -> list[int]:
+    """Drop VL image/video placeholder ids so a text teacher sees question text only."""
+    return [i for i in ids if int(i) not in _VISION_TOKEN_IDS]
+
+
+def mix_teacher_union_logprobs(
+    vl_ids: torch.Tensor,
+    vl_logprobs: torch.Tensor,
+    text_ids: torch.Tensor,
+    text_logprobs: torch.Tensor,
+    temperature: float = 1.0,
+    floor: float = -10.0,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Paper H-OPD: entropy mix of both teachers on Omega_t = K_V ∪ K_T.
+
+    Each teacher is renormalized on its own top-k. Missing union ids get
+    probability 0. Returns packed [S, <=Kv+Kt] id/logprob tables for reverse KL.
+    """
+    if vl_logprobs.ndim == 1:
+        vl_ids = vl_ids.unsqueeze(-1)
+        vl_logprobs = vl_logprobs.unsqueeze(-1)
+    if text_logprobs.ndim == 1:
+        text_ids = text_ids.unsqueeze(-1)
+        text_logprobs = text_logprobs.unsqueeze(-1)
+    n = min(vl_ids.shape[0], text_ids.shape[0], vl_logprobs.shape[0], text_logprobs.shape[0])
+    vl_ids, vl_logprobs = vl_ids[:n], vl_logprobs[:n]
+    text_ids, text_logprobs = text_ids[:n], text_logprobs[:n]
+    tau = max(float(temperature), 1e-6)
+    p_vl = torch.softmax(vl_logprobs.float(), dim=-1)
+    p_tx = torch.softmax(text_logprobs.float(), dim=-1)
+    h_vl = -(p_vl * p_vl.clamp_min(1e-12).log()).sum(dim=-1)
+    h_tx = -(p_tx * p_tx.clamp_min(1e-12).log()).sum(dim=-1)
+    w_vl = torch.exp(-h_vl / tau)
+    w_tx = torch.exp(-h_tx / tau)
+    alpha = w_vl / (w_vl + w_tx).clamp_min(1e-12)
+    kmax = int(vl_ids.shape[1] + text_ids.shape[1])
+    out_ids = torch.full((n, kmax), -1, dtype=torch.int64)
+    out_logp = torch.full((n, kmax), float(floor), dtype=torch.float32)
+    for t in range(n):
+        q: dict[int, float] = {}
+        a = float(alpha[t].item())
+        for j, tid in enumerate(vl_ids[t].tolist()):
+            tid = int(tid)
+            if tid < 0:
+                continue
+            q[tid] = q.get(tid, 0.0) + a * float(p_vl[t, j])
+        for j, tid in enumerate(text_ids[t].tolist()):
+            tid = int(tid)
+            if tid < 0:
+                continue
+            q[tid] = q.get(tid, 0.0) + (1.0 - a) * float(p_tx[t, j])
+        total = sum(q.values()) or 1.0
+        for j, (tid, mass) in enumerate(q.items()):
+            out_ids[t, j] = tid
+            out_logp[t, j] = math.log(max(mass / total, 1e-12))
+    stats = {
+        "alpha_vl": float(alpha.mean().item()),
+        "H_vl": float(h_vl.mean().item()),
+        "H_text": float(h_tx.mean().item()),
+        "omega_k": float((out_ids >= 0).sum(dim=-1).float().mean().item()),
+    }
+    return out_ids.to(torch.int32), out_logp, stats
+
+
 def mix_teacher_token_logprobs(
     vl_ids: torch.Tensor,
     vl_logprobs: torch.Tensor,
@@ -100,7 +169,7 @@ def mix_teacher_token_logprobs(
     temperature: float = 1.0,
     floor: float = -10.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Entropy-weighted mix of two teachers' p(y_t). Low entropy → higher weight."""
+    """Entropy-weighted mix of two teachers' p(y_t) only (k1 path). Low entropy → higher weight."""
     y = torch.tensor(sequence_ids, dtype=torch.int64)
     tau = max(float(temperature), 1e-6)
     log_vl = _lookup_token_logprob(vl_ids, vl_logprobs, y, floor)
@@ -233,11 +302,47 @@ class AsyncTeacherLLMServerManager:
             )
         return ids, logp
 
+    def _text_teacher_ids(self, sequence_ids: list[int], prompt_len: int) -> tuple[list[int], int]:
+        """Text teacher sees the question without image pads; response ids stay aligned."""
+        if prompt_len <= 0 or prompt_len > len(sequence_ids):
+            # Unknown prompt/response split: keep ids aligned with the student.
+            return list(sequence_ids), 0
+        prompt = strip_vision_tokens(sequence_ids[:prompt_len])
+        if not prompt:
+            prompt = list(sequence_ids[:prompt_len])
+        response = sequence_ids[prompt_len:]
+        return prompt + response, len(prompt)
+
+    def _align_text_tables(
+        self,
+        text_ids: torch.Tensor,
+        text_logp: torch.Tensor,
+        student_len: int,
+        prompt_len: int,
+        text_prompt_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pad text teacher tables to the student (VL) sequence: mix only the response."""
+        k = text_logp.shape[-1] if text_logp.ndim > 1 else 1
+        if text_logp.ndim == 1:
+            text_ids = text_ids.unsqueeze(-1)
+            text_logp = text_logp.unsqueeze(-1)
+        floor = float(self.distillation_loss_config.log_prob_min_clamp or -10.0)
+        out_ids = torch.full((student_len, k), -1, dtype=text_ids.dtype)
+        out_lp = torch.full((student_len, k), floor, dtype=text_logp.dtype)
+        resp_src = text_prompt_len
+        resp_dst = max(prompt_len, 0)
+        n = min(student_len - resp_dst, text_ids.shape[0] - resp_src)
+        if n > 0:
+            out_ids[resp_dst : resp_dst + n] = text_ids[resp_src : resp_src + n]
+            out_lp[resp_dst : resp_dst + n] = text_logp[resp_src : resp_src + n]
+        return out_ids, out_lp
+
     async def compute_teacher_logprobs_single(
         self,
         sequence_ids: list[int],
         multi_modal_data: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
+        prompt_len: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
@@ -245,6 +350,8 @@ class AsyncTeacherLLMServerManager:
         mix = bool(getattr(self.distillation_config, "mix_teachers", False))
         if mix and len(self.teacher_model_configs) > 1:
             vl_key, text_key = self._vl_text_keys()
+            p_len = int(prompt_len) if prompt_len is not None else 0
+            text_seq, text_prompt_len = self._text_teacher_ids(sequence_ids, p_len)
             vl_result, text_result = await asyncio.gather(
                 self._score_teacher(
                     vl_key,
@@ -252,7 +359,7 @@ class AsyncTeacherLLMServerManager:
                     image_data=multi_modal_data.get("images"),
                     video_data=multi_modal_data.get("videos"),
                 ),
-                self._score_teacher(text_key, sequence_ids, image_data=None, video_data=None),
+                self._score_teacher(text_key, text_seq, image_data=None, video_data=None),
                 return_exceptions=True,
             )
             floor = float(self.distillation_loss_config.log_prob_min_clamp or -10.0)
@@ -266,24 +373,42 @@ class AsyncTeacherLLMServerManager:
             if isinstance(vl_result, Exception) and isinstance(text_result, Exception):
                 raise vl_result
             if isinstance(vl_result, Exception):
-                teacher_ids, teacher_logprobs = _as_sampled(*text_result)
+                aligned = self._align_text_tables(
+                    *text_result, len(sequence_ids), p_len, text_prompt_len
+                )
+                teacher_ids, teacher_logprobs = _as_sampled(*aligned)
                 self.last_mix_stats = {"alpha_vl": 0.0, "H_vl": float("nan"), "H_text": 0.0}
             elif isinstance(text_result, Exception):
                 teacher_ids, teacher_logprobs = _as_sampled(*vl_result)
                 self.last_mix_stats = {"alpha_vl": 1.0, "H_vl": 0.0, "H_text": float("nan")}
             else:
-                mixed, stats = mix_teacher_token_logprobs(
-                    vl_result[0],
-                    vl_result[1],
-                    text_result[0],
-                    text_result[1],
-                    sequence_ids,
-                    temperature=tau,
-                    floor=floor,
+                text_ids, text_lp = self._align_text_tables(
+                    text_result[0], text_result[1], len(sequence_ids), p_len, text_prompt_len
                 )
-                teacher_ids = y.to(torch.int32).unsqueeze(-1)
-                teacher_logprobs = mixed.unsqueeze(-1)
-                self.last_mix_stats = stats
+                use_union = bool(self.distillation_loss_config.loss_settings.use_topk)
+                if use_union:
+                    teacher_ids, teacher_logprobs, stats = mix_teacher_union_logprobs(
+                        vl_result[0],
+                        vl_result[1],
+                        text_ids,
+                        text_lp,
+                        temperature=tau,
+                        floor=floor,
+                    )
+                    self.last_mix_stats = stats
+                else:
+                    mixed, stats = mix_teacher_token_logprobs(
+                        vl_result[0],
+                        vl_result[1],
+                        text_ids,
+                        text_lp,
+                        sequence_ids,
+                        temperature=tau,
+                        floor=floor,
+                    )
+                    teacher_ids = y.to(torch.int32).unsqueeze(-1)
+                    teacher_logprobs = mixed.unsqueeze(-1)
+                    self.last_mix_stats = stats
             return teacher_ids, teacher_logprobs
 
         teacher_key = self._resolve_teacher_key(routing_key)

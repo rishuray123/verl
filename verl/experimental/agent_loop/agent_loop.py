@@ -910,6 +910,7 @@ class AgentLoopWorker:
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
                 routing_key=routing_key,
+                prompt_len=len(prompt_ids),
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs

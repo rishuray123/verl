@@ -134,12 +134,18 @@ def compute_topk_loss(
     - student_mass: (bsz, seqlen/cp_size)
     - teacher_mass: (bsz, seqlen/cp_size)
     """
+    loss_mode = distillation_config.distillation_loss.loss_mode
     match config.strategy:
         case "fsdp":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
-            distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+            if loss_mode == "reverse_kl_topk":
+                distillation_loss_fn = fsdp_losses.compute_reverse_kl_topk
+            else:
+                distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
         case "megatron":
+            if loss_mode == "reverse_kl_topk":
+                raise NotImplementedError("reverse_kl_topk is implemented for FSDP only")
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
@@ -290,7 +296,9 @@ def distillation_loss(
     return distillation_loss, distillation_metrics
 
 
-@register_distillation_loss(DistillationLossSettings(names=["forward_kl_topk"], use_topk=True))  # type: ignore[arg-type]
+@register_distillation_loss(
+    DistillationLossSettings(names=["forward_kl_topk", "reverse_kl_topk"], use_topk=True)
+)  # type: ignore[arg-type]
 def compute_forward_kl_topk(
     config: ActorConfig,
     distillation_config: DistillationConfig,

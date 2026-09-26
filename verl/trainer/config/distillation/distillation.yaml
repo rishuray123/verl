@@ -112,7 +112,9 @@ teacher_models:
 # Key to route examples to the appropriate teacher model in multi-teacher setups. Should correspond to a field in the data proto, e.g., task.
 teacher_key: data_source
 
-# Paper H-OPD: score the same student Y with every teacher and mix by token entropy.
+# Score the same student Y with every teacher and mix by token entropy.
 # Off = routed MOPD (one teacher per data_source).
+# With loss_mode=reverse_kl_topk this keeps the union Ω_t = K_V ∪ K_T tables
+# (paper H-OPD). With k1 it mixes only p(y_t).
 mix_teachers: false
 mix_temperature: 1.0
