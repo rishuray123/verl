@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import copy
+import hashlib
+import json
 import logging
 import os
 import re
@@ -35,6 +37,86 @@ from verl.utils.import_utils import load_extern_object
 from verl.utils.tokenizer import normalize_token_ids
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_RLHF_CACHE_DIR = "~/.cache/verl/rlhf"
+
+
+def _overlong_filter_meta_dict(
+    data_files: list[str],
+    *,
+    tokenizer,
+    processor,
+    n_in: int,
+    max_prompt_length: int,
+    image_patch_size: int,
+    max_samples: int = -1,
+    shuffle: bool = False,
+    seed=None,
+) -> dict:
+    files = []
+    for path in data_files:
+        st = os.stat(path)
+        files.append({"path": os.path.realpath(path), "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)})
+    tok = getattr(tokenizer, "name_or_path", type(tokenizer).__name__)
+    proc = None
+    if processor is not None:
+        proc = getattr(processor, "name_or_path", type(processor).__name__)
+    return {
+        "files": files,
+        "n_in": int(n_in),
+        "max_prompt_length": int(max_prompt_length),
+        "image_patch_size": int(image_patch_size),
+        "tokenizer": str(tok),
+        "processor": None if proc is None else str(proc),
+        "max_samples": int(max_samples),
+        "shuffle": bool(shuffle),
+        "seed": seed,
+    }
+
+
+def _overlong_filter_cache_file(meta: dict, cache_dir: str) -> str:
+    key = hashlib.sha256(json.dumps(meta, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    return os.path.join(os.path.expanduser(cache_dir), "overlong_filter", f"{key}.json")
+
+
+def overlong_filter_cache_ready(
+    data_files: list[str],
+    *,
+    tokenizer,
+    processor,
+    max_prompt_length: int,
+    image_patch_size: int,
+    n_in: int,
+    cache_dir: str = _DEFAULT_RLHF_CACHE_DIR,
+    max_samples: int = -1,
+    shuffle: bool = True,
+    seed=None,
+) -> bool:
+    """True when a matching kept-index cache exists (no dataset load)."""
+    if os.environ.get("VERL_DISABLE_FILTER_CACHE", "0") == "1":
+        return False
+    if os.environ.get("HOPD_REFILTER", "0") == "1" or os.environ.get("VERL_REFRESH_FILTER_CACHE", "0") == "1":
+        return False
+    meta = _overlong_filter_meta_dict(
+        data_files,
+        tokenizer=tokenizer,
+        processor=processor,
+        n_in=n_in,
+        max_prompt_length=max_prompt_length,
+        image_patch_size=image_patch_size,
+        max_samples=max_samples,
+        shuffle=shuffle,
+        seed=seed,
+    )
+    cache_path = _overlong_filter_cache_file(meta, cache_dir)
+    if not os.path.isfile(cache_path):
+        return False
+    try:
+        with open(cache_path) as f:
+            payload = json.load(f)
+        return payload.get("meta") == meta
+    except (OSError, json.JSONDecodeError):
+        return False
 
 
 def collate_fn(data_list: list[dict]) -> dict:
@@ -191,14 +273,75 @@ class RLHFDataset(Dataset):
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 
+    def _overlong_filter_meta(self, n_in: int) -> dict:
+        return _overlong_filter_meta_dict(
+            list(self.data_files),
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            n_in=n_in,
+            max_prompt_length=self.max_prompt_length,
+            image_patch_size=self.image_patch_size,
+            max_samples=self.max_samples,
+            shuffle=self.shuffle,
+            seed=self.seed,
+        )
+
+    def _overlong_filter_cache_path(self, meta: dict) -> str:
+        cache_path = _overlong_filter_cache_file(meta, self.cache_dir)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        return cache_path
+
+    def _try_load_overlong_cache(self, dataframe: datasets.Dataset, meta: dict) -> datasets.Dataset | None:
+        if os.environ.get("VERL_DISABLE_FILTER_CACHE", "0") == "1":
+            return None
+        if os.environ.get("HOPD_REFILTER", "0") == "1" or os.environ.get("VERL_REFRESH_FILTER_CACHE", "0") == "1":
+            return None
+        cache_path = self._overlong_filter_cache_path(meta)
+        if not os.path.isfile(cache_path):
+            return None
+        try:
+            with open(cache_path) as f:
+                payload = json.load(f)
+            if payload.get("meta") != meta:
+                return None
+            kept = payload.get("kept")
+            n_in = meta["n_in"]
+            if not isinstance(kept, list) or not all(isinstance(i, int) and 0 <= i < n_in for i in kept):
+                return None
+            print(f"filter dataset cache hit: {len(kept)}/{n_in} (skip tokenize) {cache_path}")
+            self._filter_kept_indices = kept
+            return dataframe.select(kept)
+        except Exception as e:
+            print(f"filter dataset cache unusable ({e}); recomputing")
+            return None
+
+    def _write_overlong_cache(self, meta: dict, kept: list[int]) -> None:
+        if os.environ.get("VERL_DISABLE_FILTER_CACHE", "0") == "1":
+            return
+        cache_path = self._overlong_filter_cache_path(meta)
+        tmp = f"{cache_path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"meta": meta, "kept": kept}, f)
+        os.replace(tmp, cache_path)
+        print(f"filter dataset cache wrote {cache_path} kept {len(kept)}/{meta['n_in']}")
+
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts
+        self._filter_kept_indices = None
         if self.filter_overlong_prompts:
+            n_in = len(dataframe)
+            meta = self._overlong_filter_meta(n_in)
+            cached = self._try_load_overlong_cache(dataframe, meta)
+            if cached is not None:
+                return cached
+
             tokenizer = self.tokenizer
             processor = self.processor
             prompt_key = self.prompt_key
             image_key = self.image_key
             video_key = self.video_key
+            idx_col = "_overlong_src_idx"
+            dataframe = dataframe.add_column(idx_col, list(range(n_in)))
 
             if processor is not None:
                 from verl.utils.dataset.vision_utils import process_image, process_video
@@ -286,8 +429,11 @@ class RLHFDataset(Dataset):
                 num_proc=self.num_workers,
                 desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
             )
-
+            kept = [int(i) for i in dataframe[idx_col]]
+            dataframe = dataframe.remove_columns([idx_col])
+            self._filter_kept_indices = kept
             print(f"filter dataset len: {len(dataframe)}")
+            self._write_overlong_cache(meta, kept)
         return dataframe
 
     def resume_dataset_state(self):
