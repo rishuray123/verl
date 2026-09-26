@@ -80,18 +80,21 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
         )
         data["routed_experts"] = routed_experts_nested
 
-    # (bsz, seqlen, topk)
+    # (bsz, seqlen) or (bsz, seqlen, topk). Do not use index_first_axis here:
+    # the transformers flash_attn fallback reshapes to (T, last_dim) and
+    # drops the top-k axis, which breaks reverse_kl_topk gather.
     teacher_logprobs = data.get("teacher_logprobs", None)
     teacher_ids = data.get("teacher_ids", None)
     if teacher_logprobs is not None and teacher_ids is not None:
-        teacher_logprobs_rmpad = index_first_axis(teacher_logprobs.unsqueeze(-1).flatten(0, 1), indices)
-        teacher_ids_rmpad = index_first_axis(teacher_ids.unsqueeze(-1).flatten(0, 1), indices)
-        teacher_logprobs_nested = torch.nested.nested_tensor_from_jagged(
-            teacher_logprobs_rmpad.squeeze(-1), offsets=cu_seqlens
+        if teacher_ids.ndim == 2:
+            teacher_ids = teacher_ids.unsqueeze(-1)
+            teacher_logprobs = teacher_logprobs.unsqueeze(-1)
+        teacher_ids_rmpad = teacher_ids.flatten(0, 1)[indices]
+        teacher_logprobs_rmpad = teacher_logprobs.flatten(0, 1)[indices]
+        data["teacher_ids"] = torch.nested.nested_tensor_from_jagged(teacher_ids_rmpad, offsets=cu_seqlens)
+        data["teacher_logprobs"] = torch.nested.nested_tensor_from_jagged(
+            teacher_logprobs_rmpad, offsets=cu_seqlens
         )
-        teacher_ids_nested = torch.nested.nested_tensor_from_jagged(teacher_ids_rmpad.squeeze(-1), offsets=cu_seqlens)
-        data["teacher_logprobs"] = teacher_logprobs_nested
-        data["teacher_ids"] = teacher_ids_nested
 
     return data
 

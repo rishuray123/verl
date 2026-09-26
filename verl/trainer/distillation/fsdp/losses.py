@@ -32,6 +32,19 @@ def kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor:
     return kld.sum(dim=-1)
 
 
+def _align_teacher_tables(
+    student_logits: torch.Tensor, teacher_ids: torch.Tensor, teacher_logprobs: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Make teacher tables [..., K] with the same rank as student logits [..., V]."""
+    while teacher_ids.ndim > student_logits.ndim:
+        teacher_ids = teacher_ids.squeeze(-1)
+        teacher_logprobs = teacher_logprobs.squeeze(-1)
+    while teacher_ids.ndim < student_logits.ndim:
+        teacher_ids = teacher_ids.unsqueeze(-1)
+        teacher_logprobs = teacher_logprobs.unsqueeze(-1)
+    return teacher_ids, teacher_logprobs
+
+
 def reverse_kl_on_omega(
     student_logits: torch.Tensor,
     teacher_ids: torch.Tensor,
@@ -42,6 +55,7 @@ def reverse_kl_on_omega(
 
     Unused union slots use id < 0 and are dropped before the softmax.
     """
+    teacher_ids, teacher_logprobs = _align_teacher_tables(student_logits, teacher_ids, teacher_logprobs)
     valid = teacher_ids >= 0
     gather_ids = teacher_ids.clamp_min(0).long()
     student_log_probs = F.log_softmax(student_logits.float(), dim=-1)
